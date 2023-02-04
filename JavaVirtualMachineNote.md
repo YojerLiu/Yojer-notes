@@ -332,6 +332,8 @@ N/A
 
 ## 标记-清除算法
 
-N/A
+[![mark-sweep-algorithm.png](https://i.postimg.cc/xCCZxxcw/mark-sweep-algorithm.png)](https://postimg.cc/67kzThVc)
 
 ## 标记-复制算法
+
+[![mark-copy-algorithm.png](https://i.postimg.cc/VkkHLZFd/mark-copy-algorithm.png)](https://postimg.cc/qzWG1LST)
