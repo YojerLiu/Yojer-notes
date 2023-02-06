@@ -349,6 +349,8 @@ JVN被允许对满足上述三个条件的无用类进行回收，这里说的�
 
 分代收集并非只是简单划分一下内存这么容易，它至少存在一个明显的困难，即对象之间不是孤立的，**对象之间存在跨代引用**。假如进行一次只局限于新生代区域内的收集(Minor GC)，在不考虑跨代引用的情形下，一般的做法是找出新生代内与GC Roots相连的对象，在此基础上进行可达性分析，找出该区域中的存活对象。
 
+> When doing minor garbage collection, JVM follows every reference from the live roots to the objects in the young generation, and marks those objects as live, which excludes them from the garbage collection process. (quoted from this [post](https://stackoverflow.com/a/51411524/15595332))
+
 [![intergenerational-reference.png](https://i.postimg.cc/tRZCpPF1/intergenerational-reference.png)](https://postimg.cc/c6WNcv9Z)
 
 上图中红色箭头是堆外对象对堆内对象的引用，红色箭头的起点也就是所谓的GC Roots。如果我们只对新生代中与GC Roots相连的对象进行可达性分析，那么可以断定N, S, P, Q都是存活对象，但是V却不会被认为是存活对象，其占据的内存会被回收。
@@ -357,7 +359,7 @@ JVN被允许对满足上述三个条件的无用类进行回收，这里说的�
 
 [![remembered-set.png](https://i.postimg.cc/wvznt1vd/remembered-set.png)](https://postimg.cc/3yLtVJmL)
 
-如上图所示，记忆集记录了从S到P和从U到V的跨代引用。虚拟机会将记忆集记录的跨代引用也当作GC Roots进行处理。虽然这种方法需要在对象改变引用关系时维护记录数据的正确性，会增加一些运行时的开销，但比起扫描整个老年代来说仍是划算的。
+如上图所示，记忆集记录了从S到P和从U到V的跨代引用。虚拟机会将记忆集记录的跨代引用（仅指从老年代引用新生代）也当作GC Roots进行处理。虽然这种方法需要在对象改变引用关系时维护记录数据的正确性，会增加一些运行时的开销，但比起扫描整个老年代来说仍是划算的。
 
 ### 记忆集与卡表
 
@@ -369,7 +371,42 @@ JVN被允许对满足上述三个条件的无用类进行回收，这里说的�
 
 [![card-table-card-page2.png](https://i.postimg.cc/LsHPCJzN/card-table-card-page2.png)](https://postimg.cc/hX5hhPZd)
 
-一个卡页的内存中通常包含不止一个对象，只要卡页内有一个（或多个）对象的字段存在着跨代指针，那就将对应卡表的数组元素的值标识位1，称为这个元素变脏(Dirty)，如果没有则标识为0。在垃圾收集发生时，只要筛选出卡表中变脏的元素，就能轻易得出哪些卡页内存块中包含跨代指针，把它们加入GC Roots中并进行可达性分析。
+一个卡页的内存中通常包含不止一个对象，只要卡页内有一个（或多个）对象的字段存在着跨代指针，那就将对应卡表的数组元素的值标识位1，称为这个元素**变脏**(Dirty)，如果没有则标识为0。在垃圾收集发生时，只要筛选出卡表中变脏的元素，就能轻易得出哪些卡页内存块中包含跨代指针，把它们加入GC Roots中并进行可达性分析。
+
+### 写屏障
+
+**卡表何时变脏**：当老年代中的对象引用了新生代中对象时，老年代对象对应的卡表元素就应该变脏，变脏时间点原则上应该发生在引用类型字段赋值的那一刻。
+
+**如何维护卡表状态**：HotSpot是通过写屏障(Write Barrier)技术维护卡表状态的。赋值的前后都在写屏障的覆盖范围内，一旦JVM遇到这些写屏障，便会对卡表进行更新操作。虽然更新卡表会产生额外的开销，但这个开销与Minor GC时扫描整个老年代的代价相比还是低得多。
+> When an object in old generation writes/updates a reference to an object in the young generation, this action goes through something called write barrier. When JVM sees these write barriers, it updates the corresponding entry in the card table. (quoted from this [post](https://stackoverflow.com/a/51411524/15595332))
+
+**False Sharing**: 当多线程修改互相独立的变量时，如果这些变量恰好处于同一个缓存行(Cache Line)，就会彼此影响(写回、无效化或者同步)而导致性能降低。
+
+> The cache records cached memory locations in units of cache lines containing multiple words of memory. A typical cache line might contain 4–32 words of memory. On a cache miss, the cache line is filled from main memory. So a series of memory reads to nearby memory locations are likely to mostly hit in the cache. When there is a cache miss, a whole sequence of memory words is requested from main memory at once. This works well because memory chips are designed to make reading a whole series of contiguous locations cheap. (quoted from this [page](https://www.cs.cornell.edu/courses/cs3110/2012sp/lectures/lec25-locality/lec25.html))
+>
+> "false sharing" is something that happens in (some) cache systems when two threads (or rather two cores) writes to two different variables that belongs to the same cache line. In such cases the two threads/cores competes to own the cache line (for writing) and consequently, they'll have to refresh the memory and the cache again and again. That's bad for performance. (quoted from this [post](https://stackoverflow.com/a/61632872/15595332))
+
+假设处理器的cache line大小为64 bytes，由于一个卡表元素占1 byte，64个卡表元素将处于同一个cache line中。这64个卡表元素所对应的卡页的总的内存为32 KB (64 $\times$ 512 bytes)，也就是说如果不同线程更新的对象更好处于这32 KB的内存区域内，就会导致更新卡表时正好写入同一个cache line而影响性能。为了避免False Sharing问题，可以在每次JVM遇到写屏障需要更新卡表时，先检查卡表标记，只有当该卡表元素未被标记过时才将其标记为变脏。
+
+## 根节点枚举
+
+可达性分析可分为两个阶段：
+
+1. 根节点枚举，找出所有的GC Roots
+2. 从根节点开始查找引用链
+
+目前查找引用链这一过程已经可以做到与用户线程一起并发，但根节点枚举这一过程仍必须暂停用户线程才能进行(Stop the World)。在枚举期间，整个系统看起来像被冻结在某个时间点上，不会出现在分析过程中，用户进程还在运行，根节点集合的对象引用关系还在不断变化这种情况。如果这点都不能满足的话，可达性分析结果的准确性也就无法保证。
+
+固定可作为GC Roots的结点主要在全局性的引用（例如常量或类静态属性）与执行上下文（例如栈帧中的本地变量表）中。尽管目标很明确，但把方法区中的常量或类静态属性和栈帧中的本地变量表等区域全部扫描一遍以找出对象引用实在太过于费时。
+
+OopMap: 
+
+[link 1](https://zhuanlan.zhihu.com/p/441867302)
+
+[link 2](http://09itblog.site/?p=901)
+
+[link 3](https://www.pudn.com/news/628f83bdbf399b7f351eb02d.html)
+
 
 ## 标记-清除算法
 
